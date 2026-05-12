@@ -133,7 +133,7 @@ def get_combined_args(parser : ArgumentParser):
     args_cmdline = parser.parse_args(cmdlne_string)
 
     model_path_list = args_cmdline.model_path.split('/')
-    model_path_list[-1] += f'_{args_cmdline.gs_type}'
+    # model_path_list[-1] += f'_{args_cmdline.gs_type}'
     args_cmdline.model_path = '/'.join(model_path_list)
 
     try:

@@ -39,6 +39,43 @@ except ImportError:
 
 gs_dict = {'GS': GaussianModel, 'DRK': DRKModel}
 
+class Timer:
+    def __init__(self):
+        self._iter_start = torch.cuda.Event(enable_timing = True)
+        self._iter_end = torch.cuda.Event(enable_timing = True)
+        self._optim_start = torch.cuda.Event(enable_timing = True)
+        self._optim_end = torch.cuda.Event(enable_timing = True)
+        self.total_render_time = 0.0
+        self.total_optim_time = 0.0
+    
+    def iter_start(self):
+        self._iter_start.record()
+    
+    def iter_end(self):
+        self._iter_end.record()
+        torch.cuda.synchronize()
+        self.total_render_time += self._iter_start.elapsed_time(self._iter_end) / 1e3 # ms to s
+
+    def optim_start(self):
+        self._optim_start.record()
+
+    def optim_end(self):
+        self._optim_end.record()
+        torch.cuda.synchronize()
+        self.total_optim_time += self._optim_start.elapsed_time(self._optim_end) / 1e3 # ms to s
+        
+    @property
+    def total_times(self):
+        return self.total_render_time + self.total_optim_time
+
+    @property
+    def metrics(self):
+        return {
+            "train_times": self.total_times,
+            "train_render_times": self.total_render_time,
+            "train_optimal_times": self.total_optim_time
+        }
+
 
 def getProjectionMatrix(znear, zfar, fovX, fovY):
     tanHalfFovY = math.tan((fovY / 2))
@@ -122,7 +159,7 @@ class Trainer:
 
         gs_model_type = gs_dict[self.dataset.gs_type]
         model_path_list = self.dataset.model_path.split('/')
-        model_path_list[-1] += f'_{self.dataset.gs_type}'
+        # model_path_list[-1] += f'_{self.dataset.gs_type}'
         self.dataset.model_path = '/'.join(model_path_list)
 
         if opt.pure_train:
@@ -139,7 +176,7 @@ class Trainer:
                 print("No trained model found, starting from scratch!")
 
         self.first_iter = 0
-        self.tb_writer = prepare_output_and_logger(self.dataset)
+        # self.tb_writer = prepare_output_and_logger(self.dataset)
         
         self.gaussians = gs_model_type(self.dataset.sh_degree)
         scene = Scene(self.dataset, self.gaussians, load_iteration=load_iteration, shuffle=not evaluate)
@@ -553,15 +590,19 @@ class Trainer:
     
     # no gui mode
     def train(self):
+        self.timer = Timer()
         while self.iteration < self.opt.iterations+1:
             self.train_step()
+        print(f"Gaussian number: {self.gaussians._xyz.shape[0]}")
+        with open(os.path.join(self.scene.model_path, "training_time.json"), 'w') as f:
+            json.dump(self.timer.metrics, f)
     
     def train_step(self):
         self.gaussians.train()
         self.gaussians.current_opt_step = self.iteration
         self.gaussians.update(self.iteration)
 
-        self.iter_start.record()
+        self.timer.iter_start()
 
         self.gaussians.update_learning_rate(self.iteration)
 
@@ -608,7 +649,7 @@ class Trainer:
         if self.iteration < self.opt.densify_until_iter:
             self.gaussians.grad_postprocess()
 
-        self.iter_end.record()
+        self.timer.iter_end()
 
         with torch.no_grad():
             # Progress bar
@@ -620,23 +661,24 @@ class Trainer:
                 self.progress_bar.close()
 
             # Log and save
-            cur_psnr, cur_ssim, cur_lpips, val_psnr = training_report(self.tb_writer, self.iteration, Ll1, loss, l1_loss, self.iter_start.elapsed_time(self.iter_end), self.testing_iterations, self.scene, self.gaussians.render_func, (self.pipe, self.background), trainer=self)
-            if self.iteration in self.testing_iterations:
-                if cur_psnr.item() > self.best_psnr:
-                    self.best_psnr = cur_psnr.item()
-                    self.best_iteration = self.iteration
-                    self.best_ssim = cur_ssim.item()
-                    self.best_lpips = cur_lpips.item()
-                if val_psnr.item() > self.best_psnr_val:
-                    self.best_psnr_val = val_psnr.item()
-                    self.scene.save(self.iteration)
-                elif cur_psnr.item() < 20:
-                    print('Test right after opacity resetting!')
+            # cur_psnr, cur_ssim, cur_lpips, val_psnr = training_report(self.tb_writer, self.iteration, Ll1, loss, l1_loss, self.iter_start.elapsed_time(self.iter_end), self.testing_iterations, self.scene, self.gaussians.render_func, (self.pipe, self.background), trainer=self)
+            # if self.iteration in self.testing_iterations:
+            #     if cur_psnr.item() > self.best_psnr:
+            #         self.best_psnr = cur_psnr.item()
+            #         self.best_iteration = self.iteration
+            #         self.best_ssim = cur_ssim.item()
+            #         self.best_lpips = cur_lpips.item()
+            #     if val_psnr.item() > self.best_psnr_val:
+            #         self.best_psnr_val = val_psnr.item()
+            #         self.scene.save(self.iteration)
+            #     elif cur_psnr.item() < 20:
+            #         print('Test right after opacity resetting!')
             
             if (self.iteration in self.saving_iterations):
                 print("\n[ITER {}] Saving gaussians".format(self.iteration))
                 self.scene.save(self.iteration)
 
+            self.timer.optim_start()
             # Densification
             if self.iteration < self.opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
@@ -659,6 +701,7 @@ class Trainer:
             if self.iteration < self.opt.iterations:
                 self.gaussians.optimizer.step()
                 self.gaussians.optimizer.zero_grad(set_to_none = True)
+            self.timer.optim_end()
 
             if (self.iteration in self.checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(self.iteration))
@@ -983,10 +1026,11 @@ if __name__ == "__main__":
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     evaluation = args.metric
+    prepare_output_and_logger(args)
     trainer = Trainer(args, lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, evaluate=evaluation)
 
     if args.metric:
-        training_report(None, trainer.iteration, None, None, l1_loss, None, [trainer.iteration], trainer.scene, trainer.gaussians.render_func, (trainer.pipe, trainer.background), True, trainer)
+        # training_report(None, trainer.iteration, None, None, l1_loss, None, [trainer.iteration], trainer.scene, trainer.gaussians.render_func, (trainer.pipe, trainer.background), True, trainer)
         print("\nMetric complete.")
     elif args.gui:
         trainer.render()

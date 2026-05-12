@@ -1,0 +1,5 @@
+submodules/drk_splatting/build
+submodules/drk_splatting/drk_splatting.egg-info
+submodules/simple-knn/build
+submodules/simple-knn/simple_knn.egg-info
+__pycache__/
